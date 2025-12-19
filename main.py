@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -66,91 +66,126 @@ class UploadResponse(BaseModel):
 @app.post("/validate-log", response_model=UploadResponse)
 async def validate_log(
     date: str = Form(...),
-    screenshots: List[UploadFile] = File(...)
+    screenshots: List[UploadFile] = File(None),
+    video: UploadFile = File(None)
 ):
-    logger.info(f"Processing validation request for date: {date} with {len(screenshots)} screenshots")
+    logger.info(f"Processing validation request for date: {date}")
+    
     try:
-        if not screenshots:
-            logger.warning("No images provided in request")
-            return UploadResponse(success=False, reason="No images provided")
+        if not screenshots and not video:
+            logger.warning("No media provided in request")
+            return UploadResponse(success=False, reason="No images or video provided")
         
-        # Read and validate all images
-        image_contents = []
+        contents = []
         image_hashes = []
+        gemini_reason = ""
         
-        for screenshot in screenshots:
-            contents = await screenshot.read()
+        # ---------------------------------------------------------------------
+        # VIDEO FLOW
+        # ---------------------------------------------------------------------
+        if video:
+            logger.info(f"Processing video upload: {video.filename}")
+            video_content = await video.read()
+            video_hash = hashlib.sha256(video_content).hexdigest()
             
-            # Compute hash for deduplication
-            image_hash = hashlib.sha256(contents).hexdigest()
-            logger.info(f"Computed hash for {screenshot.filename}: {image_hash[:16]}...")
-            
-            # Check if this image was used before on a different date
-            is_duplicate, previous_date = check_image_hash(image_hash, date)
+            # Deduplication check
+            is_duplicate, previous_date = check_image_hash(video_hash, date)
             if is_duplicate:
-                msg = f"Image {screenshot.filename} was already used on {previous_date}. Please upload fresh screenshots."
+                msg = f"Video {video.filename} was already used on {previous_date}. Please upload a fresh video."
                 logger.warning(msg)
                 return UploadResponse(success=False, reason=msg)
+                
+            image_hashes.append(video_hash)
             
-            # Verify it's a valid image using PIL
-            try:
-                image = Image.open(io.BytesIO(contents))
-                image.verify()
+            # Prepare Gemini content for video
+            prompt = f"""
+            CONTEXT:
+            You are an AI validator for a habit-tracking app. 
+            The user has uploaded a screen recording of their food log app (e.g. MyFitnessPal, LoseIt).
+            
+            CURRENT DATE: {date}
+            
+            YOUR TASK:
+            Analyze the video to verify:
+            1. The user is in a food tracking app (showing food/calories).
+            2. They scroll/navigate to show the DATE, and it matches CURRENT DATE: {date}.
+            3. The total calories for the day seem to be > 1200.
+            
+            OUTPUT:
+            Return ONLY the word 'TRUE' if all checks pass.
+            Return ONLY the word 'FALSE' if any check fails.
+            """
+            
+            contents = [
+                types.Part.from_text(text=prompt),
+                types.Part.from_bytes(data=video_content, mime_type=video.content_type or "video/mp4")
+            ]
+            gemini_reason = "Video analysis"
+            
+        # ---------------------------------------------------------------------
+        # IMAGE FLOW
+        # ---------------------------------------------------------------------
+        elif screenshots:
+            logger.info(f"Processing {len(screenshots)} screenshots")
+            
+            image_parts = []
+            for screenshot in screenshots:
+                content = await screenshot.read()
                 
-                # Re-open for metadata extraction (verify() can close/modify the file pointer)
-                image = Image.open(io.BytesIO(contents))
-                
-                # Check metadata date
-                img_date = get_image_date(image)
-                logger.info(f"Extracted date from {screenshot.filename}: {img_date}")
-                
-                if img_date and img_date != date:
-                    msg = f"Image date {img_date} does not match log date {date}"
+                # Compute hash
+                img_hash = hashlib.sha256(content).hexdigest()
+                is_duplicate, previous_date = check_image_hash(img_hash, date)
+                if is_duplicate:
+                    msg = f"Image {screenshot.filename} was already used on {previous_date}. Please upload fresh screenshots."
                     logger.warning(msg)
                     return UploadResponse(success=False, reason=msg)
                 
-                if not img_date:
-                    logger.warning(f"Could not verify date metadata in {screenshot.filename}. Proceeding with visual inspection.")
+                # Basic validation
+                try:
+                    img = Image.open(io.BytesIO(content))
+                    img.verify()
+                    # Re-open for metadata
+                    img = Image.open(io.BytesIO(content))
+                    img_date = get_image_date(img)
                     
-            except Exception as e:
-                logger.error(f"Image validation failed for {screenshot.filename}: {e}")
-                return UploadResponse(success=False, reason=f"Invalid image format or metadata error: {screenshot.filename} ({str(e)})")
+                    if img_date and img_date != date:
+                        msg = f"Image date {img_date} does not match log date {date}"
+                        logger.warning(msg)
+                        return UploadResponse(success=False, reason=msg)
+                except Exception as e:
+                    return UploadResponse(success=False, reason=f"Invalid image: {screenshot.filename} ({str(e)})")
+
+                image_hashes.append(img_hash)
+                image_parts.append(types.Part.from_bytes(data=content, mime_type=screenshot.content_type or "image/jpeg"))
+
+            prompt = f"""
+            CONTEXT:
+            You are an AI validator for a habit-tracking app. 
+            Users must upload screenshot(s) of their daily food log to prove they are tracking their food intake.
             
-            image_contents.append((contents, screenshot.content_type or "image/jpeg"))
-            image_hashes.append(image_hash)
-        
-        # Prompt for Gemini 3 Flash
-        image_count = len(image_contents)
-        prompt = f"""
-        CONTEXT:
-        You are an AI validator for a habit-tracking app. 
-        Users must upload screenshot(s) of their daily food log (e.g., from MyFitnessPal, LoseIt, etc.) to prove they are tracking their food intake.
-        If they fail to upload a valid, current log with enough calories, their phone locks them out until they do.
-        
-        CURRENT DATE: {date}
-        INPUT: {image_count} image(s) provided.
-        
-        YOUR TASK:
-        Analyze the provided image(s) to verify it is a legitimate, unique food log for TODAY.
-        
-        VERIFICATION STEPS:
-        1. **Relevance**: Is this an image of a food log or calorie tracker? If it's a random photo (e.g., a selfie, a wall, a meme), return 'FALSE'.
-        2. **Calorie Check**: Sum the total calories across all images. 
-           - If the total is LESS THAN 1200, return 'FALSE'.
-           - If the log seems visibly incomplete (e.g., only shows breakfast) and total is low, return 'FALSE'.
-        
-        OUTPUT:
-        Return ONLY the word 'TRUE' if it passes all checks (valid log, >1200 calories).
-        Return ONLY the word 'FALSE' if it fails any check.
-        """
-        
-        # Build content array with prompt + all images
-        contents = [types.Part.from_text(text=prompt)]
-        for image_data, mime_type in image_contents:
-            contents.append(types.Part.from_bytes(data=image_data, mime_type=mime_type))
-        
-        # Call Gemini 3 Flash Preview with "low thinking" (minimal) as requested
-        # Docs: https://ai.google.dev/gemini-api/docs/gemini-3
+            CURRENT DATE: {date}
+            INPUT: {len(image_parts)} image(s).
+            
+            YOUR TASK:
+            Analyze the provided image(s) to verify it is a legitimate, unique food log for TODAY.
+            
+            VERIFICATION STEPS:
+            1. **Relevance**: Is this a food log? If random photo, return 'FALSE'.
+            2. **Calorie Check**: Sum total calories. 
+               - If < 1200, return 'FALSE'.
+               - If visibly incomplete (e.g. only breakfast) and low calories, return 'FALSE'.
+            
+            OUTPUT:
+            Return ONLY the word 'TRUE' if it passes.
+            Return ONLY the word 'FALSE' if it fails.
+            """
+            
+            contents = [types.Part.from_text(text=prompt)] + image_parts
+            gemini_reason = f"Image analysis ({len(image_parts)} images)"
+
+        # ---------------------------------------------------------------------
+        # GEMINI CALL
+        # ---------------------------------------------------------------------
         logger.info("Sending request to Gemini model...")
         response = client.models.generate_content(
             model="gemini-3-flash-preview", 
@@ -158,14 +193,12 @@ async def validate_log(
             config=types.GenerateContentConfig(
                 temperature=1,
                 thinking_config=types.ThinkingConfig(
-                    thinking_level="LOW", # Low thinking for speed as requested
-                    include_thoughts=False # We don't need the thought trace in the response
+                    thinking_level="LOW", 
+                    include_thoughts=False 
                 )
             )
         )
         
-        # Gemini is instructed to return ONLY 'TRUE' or 'FALSE'.
-        # Be strict here to avoid accidental passes like "untrue".
         raw_text = response.text or ""
         logger.info(f"Gemini raw response: {raw_text}")
         
@@ -177,15 +210,14 @@ async def validate_log(
         if is_accurate:
             # Record the successful upload
             record_upload(date)
-            
-            # Store image hashes to prevent reuse
-            for img_hash in image_hashes:
-                record_image_hash(img_hash, date)
-            logger.info(f"Stored {len(image_hashes)} image hash(es) for date {date}")
+            # Store hashes
+            for h in image_hashes:
+                record_image_hash(h, date)
+            logger.info(f"Stored {len(image_hashes)} hashes for {date}")
 
         return UploadResponse(
             success=is_accurate,
-            reason=f"Gemini evaluation ({image_count} image{'s' if image_count > 1 else ''}): {text_response}"
+            reason=f"Gemini evaluation ({gemini_reason}): {text_response}"
         )
 
     except Exception as e:
@@ -196,11 +228,36 @@ class StatusResponse(BaseModel):
     submitted_today: bool
     submitted_yesterday: bool
 
+# Day boundary hour (5am) - days run from 5am to 5am
+DAY_START_HOUR = 5
+
+def get_logical_date(dt: datetime = None) -> str:
+    """
+    Get the 'logical date' for food logging purposes.
+    Days start at 5am, so 4am on Dec 19 is still 'Dec 18'.
+    """
+    if dt is None:
+        dt = datetime.now()
+    
+    # If before 5am, it's still "yesterday" for logging purposes
+    if dt.hour < DAY_START_HOUR:
+        dt = dt - timedelta(days=1)
+    
+    return dt.strftime("%Y-%m-%d")
+
+def get_logical_yesterday(dt: datetime = None) -> str:
+    """Get yesterday's logical date."""
+    if dt is None:
+        dt = datetime.now()
+    return get_logical_date(dt - timedelta(days=1))
+
 @app.get("/check-status", response_model=StatusResponse)
 def check_status():
-    """Check if submissions exist for today and yesterday."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    """Check if submissions exist for today and yesterday (using 5am day boundary)."""
+    today = get_logical_date()
+    yesterday = get_logical_yesterday()
+    
+    logger.info(f"Checking status - logical today: {today}, logical yesterday: {yesterday}")
     
     return StatusResponse(
         submitted_today=has_submission_for_date(today),
