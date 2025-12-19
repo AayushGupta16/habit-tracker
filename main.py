@@ -5,11 +5,12 @@ from google import genai
 from google.genai import types
 import os
 from dotenv import load_dotenv
-from PIL import Image, ExifTags
+from PIL import Image
 import io
 import logging
 import hashlib
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # Configure logging
 logging.basicConfig(
@@ -43,21 +44,9 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-def get_image_date(image: Image.Image) -> str | None:
-    try:
-        exif = image.getexif()
-        if not exif:
-            return None
-        # 36867 is DateTimeOriginal, 306 is DateTime
-        # We prefer DateTimeOriginal (creation time) over DateTime (modification time)
-        date_str = exif.get(36867) or exif.get(306)
-        if date_str:
-            # Format is usually "YYYY:MM:DD HH:MM:SS"
-            # We want to return "YYYY-MM-DD"
-            return date_str.split(' ')[0].replace(':', '-')
-    except Exception:
-        pass
-    return None
+# Hard-coded "user local time" for now.
+# If you later support multiple users/timezones, push this to a per-user setting.
+SF_TZ = ZoneInfo("America/Los_Angeles")
 
 class UploadResponse(BaseModel):
     success: bool
@@ -103,12 +92,16 @@ async def validate_log(
             You are an AI validator for a habit-tracking app. 
             The user has uploaded a screen recording of their food log app (e.g. MyFitnessPal, LoseIt).
             
-            CURRENT DATE: {date}
+            CURRENT DATE (LOGICAL DATE): {date}
+            IMPORTANT TIME RULE:
+            - The user's "day" runs from 5:00am to 5:00am in their local time (America/Los_Angeles).
+            - If the recording is taken before 5:00am, MyFitnessPal may label the log as "Yesterday".
+              In that case, "Yesterday" is VALID for CURRENT DATE as long as the on-screen time is before 5:00am.
             
             YOUR TASK:
             Analyze the video to verify:
             1. The user is in a food tracking app (showing food/calories).
-            2. They scroll/navigate to show the DATE, and it matches CURRENT DATE: {date}.
+            2. They scroll/navigate to show the DATE, and it matches CURRENT DATE: {date} (using the time rule above).
             3. The total calories for the day seem to be > 1200.
             
             OUTPUT:
@@ -144,14 +137,6 @@ async def validate_log(
                 try:
                     img = Image.open(io.BytesIO(content))
                     img.verify()
-                    # Re-open for metadata
-                    img = Image.open(io.BytesIO(content))
-                    img_date = get_image_date(img)
-                    
-                    if img_date and img_date != date:
-                        msg = f"Image date {img_date} does not match log date {date}"
-                        logger.warning(msg)
-                        return UploadResponse(success=False, reason=msg)
                 except Exception as e:
                     return UploadResponse(success=False, reason=f"Invalid image: {screenshot.filename} ({str(e)})")
 
@@ -163,17 +148,24 @@ async def validate_log(
             You are an AI validator for a habit-tracking app. 
             Users must upload screenshot(s) of their daily food log to prove they are tracking their food intake.
             
-            CURRENT DATE: {date}
+            CURRENT DATE (LOGICAL DATE): {date}
+            IMPORTANT TIME RULE:
+            - The user's "day" runs from 5:00am to 5:00am in their local time (America/Los_Angeles).
+            - If the screenshot is taken before 5:00am, MyFitnessPal may label the log as "Yesterday".
+              In that case, "Yesterday" is VALID for CURRENT DATE as long as the on-screen time is before 5:00am.
             INPUT: {len(image_parts)} image(s).
             
             YOUR TASK:
-            Analyze the provided image(s) to verify it is a legitimate, unique food log for TODAY.
+            Analyze the provided image(s) to verify it is a legitimate, unique food log for CURRENT DATE (using the time rule above).
             
             VERIFICATION STEPS:
             1. **Relevance**: Is this a food log? If random photo, return 'FALSE'.
             2. **Calorie Check**: Sum total calories. 
                - If < 1200, return 'FALSE'.
                - If visibly incomplete (e.g. only breakfast) and low calories, return 'FALSE'.
+            3. **Date Check**:
+               - Prefer explicit dates shown in the app UI.
+               - If the app shows a relative label like "Yesterday", treat it as VALID for CURRENT DATE only when the device/status-bar time visible in the screenshot is before 5:00am.
             
             OUTPUT:
             Return ONLY the word 'TRUE' if it passes.
@@ -237,7 +229,7 @@ def get_logical_date(dt: datetime = None) -> str:
     Days start at 5am, so 4am on Dec 19 is still 'Dec 18'.
     """
     if dt is None:
-        dt = datetime.now()
+        dt = datetime.now(SF_TZ)
     
     # If before 5am, it's still "yesterday" for logging purposes
     if dt.hour < DAY_START_HOUR:
@@ -248,7 +240,7 @@ def get_logical_date(dt: datetime = None) -> str:
 def get_logical_yesterday(dt: datetime = None) -> str:
     """Get yesterday's logical date."""
     if dt is None:
-        dt = datetime.now()
+        dt = datetime.now(SF_TZ)
     return get_logical_date(dt - timedelta(days=1))
 
 @app.get("/check-status", response_model=StatusResponse)
