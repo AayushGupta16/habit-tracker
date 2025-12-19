@@ -69,26 +69,45 @@ async def validate_log(
     video: UploadFile = File(None)
 ):
     # Enforce server-side "debt queue" logic:
-    # - target_due_date is the latest logical date that must be satisfied as of now.
+    # - target_due_date is the latest logical date that must be satisfied as of now (yesterday after 5am).
     # - next_due_date is the oldest missing date; users must submit sequentially to catch up.
+    # - today_logical is the current logical day (allows proactive logging before deadline).
     now = datetime.now(SF_TZ)
     target_due_date = get_due_logical_date(now)
+    today_logical = get_logical_date(now)
     next_due_date = advance_next_due_date(target_due_date)
 
-    if next_due_date > target_due_date:
-        msg = "Nothing is currently due. You're already caught up."
-        logger.info(f"{msg} (target_due_date={target_due_date}, next_due_date={next_due_date})")
-        return UploadResponse(success=False, reason=msg)
+    # Determine which date to accept:
+    # 1. If behind (next_due_date <= target_due_date): must submit for next_due_date
+    # 2. If caught up (next_due_date > target_due_date): can submit for today_logical (proactive)
+    is_caught_up = next_due_date > target_due_date
+    
+    if is_caught_up:
+        # User is caught up on past dues. Allow proactive submission for TODAY.
+        acceptable_date = today_logical
+        
+        if has_submission_for_date(today_logical):
+            msg = f"You've already logged for today ({today_logical}). Nothing more to submit."
+            logger.info(msg)
+            return UploadResponse(success=False, reason=msg)
+        
+        if date != acceptable_date:
+            msg = f"You're caught up! Submit for today: {acceptable_date}"
+            logger.warning(f"{msg} (client_sent={date})")
+            return UploadResponse(success=False, reason=msg)
+    else:
+        # User has backlog. Must submit for next_due_date.
+        acceptable_date = next_due_date
+        
+        if date != acceptable_date:
+            msg = f"Invalid date. You have a backlog. Submit for: {next_due_date}"
+            logger.warning(f"{msg} (client_sent={date}, target_due_date={target_due_date}, now={now.isoformat()})")
+            return UploadResponse(success=False, reason=msg)
 
-    if date != next_due_date:
-        msg = f"Invalid date. The server will only accept the next due date: {next_due_date}"
-        logger.warning(f"{msg} (client_sent={date}, target_due_date={target_due_date}, now={now.isoformat()})")
-        return UploadResponse(success=False, reason=msg)
-
-    if has_submission_for_date(next_due_date):
-        msg = f"A valid log for {next_due_date} has already been submitted."
-        logger.info(msg)
-        return UploadResponse(success=False, reason=msg)
+        if has_submission_for_date(next_due_date):
+            msg = f"A valid log for {next_due_date} has already been submitted."
+            logger.info(msg)
+            return UploadResponse(success=False, reason=msg)
 
     logger.info(f"Processing validation request for next due date: {date} (target_due_date={target_due_date})")
     
@@ -279,7 +298,8 @@ class StatusResponse(BaseModel):
     submitted_yesterday: bool
     target_due_date: str
     next_due_date: str
-    is_caught_up: bool
+    is_caught_up: bool  # True = today is logged (nothing to submit)
+    should_lock: bool   # True = has overdue backlog (past deadline missed)
     config: AppConfig
 
 @app.get("/check-status", response_model=StatusResponse)
@@ -288,17 +308,37 @@ def check_status():
     today = get_logical_date()
     yesterday = get_logical_yesterday()
     target_due_date = get_due_logical_date()
-    next_due_date = advance_next_due_date(target_due_date)
-    is_caught_up = next_due_date > target_due_date
+    next_due_date_from_backlog = advance_next_due_date(target_due_date)
     
-    logger.info(f"Checking status - logical today: {today}, logical yesterday: {yesterday}")
+    # Determine what the user should submit next:
+    # - If backlog exists (next_due <= target_due): submit for next_due_date_from_backlog
+    # - If no backlog: submit for today (proactive logging)
+    has_backlog = next_due_date_from_backlog <= target_due_date
+    
+    if has_backlog:
+        effective_next_due = next_due_date_from_backlog
+    else:
+        effective_next_due = today
+    
+    # should_lock: True if there's a backlog (past deadline missed)
+    # This controls whether the phone should be locked
+    should_lock = has_backlog
+    
+    # is_caught_up: True if today's log is already submitted (nothing to submit)
+    # This controls whether upload buttons are shown
+    is_caught_up = has_submission_for_date(today) and not has_backlog
+    
+    logger.info(f"Checking status - logical today: {today}, yesterday: {yesterday}, "
+                f"target_due: {target_due_date}, backlog_next: {next_due_date_from_backlog}, "
+                f"effective_next: {effective_next_due}, should_lock: {should_lock}, is_caught_up: {is_caught_up}")
     
     return StatusResponse(
         submitted_today=has_submission_for_date(today),
         submitted_yesterday=has_submission_for_date(yesterday),
         target_due_date=target_due_date,
-        next_due_date=next_due_date,
+        next_due_date=effective_next_due,
         is_caught_up=is_caught_up,
+        should_lock=should_lock,
         config=AppConfig(
             day_start_hour=DAY_START_HOUR,
             timezone=TIMEZONE_NAME
