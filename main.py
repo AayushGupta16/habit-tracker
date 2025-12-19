@@ -20,7 +20,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from contextlib import asynccontextmanager
-from email_scheduler import init_db, record_upload, create_scheduler, check_image_hash, record_image_hash, has_submission_for_date
+from email_scheduler import (
+    init_db, 
+    record_upload, 
+    create_scheduler, 
+    check_image_hash, 
+    record_image_hash, 
+    has_submission_for_date, 
+    advance_next_due_date,
+    get_logical_date,
+    get_logical_yesterday,
+    get_due_logical_date,
+    SF_TZ,
+    DAY_START_HOUR,
+    TIMEZONE_NAME
+)
 
 load_dotenv()
 
@@ -44,10 +58,6 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-# Hard-coded "user local time" for now.
-# If you later support multiple users/timezones, push this to a per-user setting.
-SF_TZ = ZoneInfo("America/Los_Angeles")
-
 class UploadResponse(BaseModel):
     success: bool
     reason: str | None = None
@@ -58,7 +68,29 @@ async def validate_log(
     screenshots: List[UploadFile] = File(None),
     video: UploadFile = File(None)
 ):
-    logger.info(f"Processing validation request for date: {date}")
+    # Enforce server-side "debt queue" logic:
+    # - target_due_date is the latest logical date that must be satisfied as of now.
+    # - next_due_date is the oldest missing date; users must submit sequentially to catch up.
+    now = datetime.now(SF_TZ)
+    target_due_date = get_due_logical_date(now)
+    next_due_date = advance_next_due_date(target_due_date)
+
+    if next_due_date > target_due_date:
+        msg = "Nothing is currently due. You're already caught up."
+        logger.info(f"{msg} (target_due_date={target_due_date}, next_due_date={next_due_date})")
+        return UploadResponse(success=False, reason=msg)
+
+    if date != next_due_date:
+        msg = f"Invalid date. The server will only accept the next due date: {next_due_date}"
+        logger.warning(f"{msg} (client_sent={date}, target_due_date={target_due_date}, now={now.isoformat()})")
+        return UploadResponse(success=False, reason=msg)
+
+    if has_submission_for_date(next_due_date):
+        msg = f"A valid log for {next_due_date} has already been submitted."
+        logger.info(msg)
+        return UploadResponse(success=False, reason=msg)
+
+    logger.info(f"Processing validation request for next due date: {date} (target_due_date={target_due_date})")
     
     try:
         if not screenshots and not video:
@@ -87,22 +119,34 @@ async def validate_log(
             image_hashes.append(video_hash)
             
             # Prepare Gemini content for video
+            # Get human-readable date and today for context
+            required_date_obj = datetime.strptime(date, "%Y-%m-%d")
+            required_date_formatted = required_date_obj.strftime("%B %d, %Y")  # e.g. "December 18, 2024"
+            required_date_short = required_date_obj.strftime("%b %d")  # e.g. "Dec 18"
+            today_formatted = datetime.now(SF_TZ).strftime("%B %d, %Y")
+            
             prompt = f"""
             CONTEXT:
             You are an AI validator for a habit-tracking app. 
             The user has uploaded a screen recording of their food log app (e.g. MyFitnessPal, LoseIt).
             
-            CURRENT DATE (LOGICAL DATE): {date}
-            IMPORTANT TIME RULE:
-            - The user's "day" runs from 5:00am to 5:00am in their local time (America/Los_Angeles).
-            - If the recording is taken before 5:00am, MyFitnessPal may label the log as "Yesterday".
-              In that case, "Yesterday" is VALID for CURRENT DATE as long as the on-screen time is before 5:00am.
+            REQUIRED DATE TO VERIFY: {date} ({required_date_formatted})
+            TODAY'S ACTUAL DATE: {today_formatted} ({TIMEZONE_NAME})
+            
+            The food log app must show entries for **{required_date_formatted}** (also written as "{required_date_short}" or "{date}").
+            
+            SPECIAL CASE - "Yesterday" label:
+            - If the device clock visible in the recording shows a time BEFORE {DAY_START_HOUR}:00am, AND
+            - The food log app displays "Yesterday" instead of an explicit date, AND  
+            - "Yesterday" relative to that device time equals {required_date_formatted},
+            - THEN treat "Yesterday" as valid for the required date.
+            - Otherwise, the app MUST show the explicit date {required_date_formatted}.
             
             YOUR TASK:
             Analyze the video to verify:
             1. The user is in a food tracking app (showing food/calories).
-            2. They scroll/navigate to show the DATE, and it matches CURRENT DATE: {date} (using the time rule above).
-            3. The total calories for the day seem to be > 1200.
+            2. They scroll/navigate to show the DATE, and it matches the REQUIRED DATE: {required_date_formatted}.
+            3. The total calories for the day are > 1200.
             
             OUTPUT:
             Return ONLY the word 'TRUE' if all checks pass.
@@ -143,33 +187,41 @@ async def validate_log(
                 image_hashes.append(img_hash)
                 image_parts.append(types.Part.from_bytes(data=content, mime_type=screenshot.content_type or "image/jpeg"))
 
+            # Get human-readable date and today for context
+            required_date_obj = datetime.strptime(date, "%Y-%m-%d")
+            required_date_formatted = required_date_obj.strftime("%B %d, %Y")  # e.g. "December 18, 2024"
+            required_date_short = required_date_obj.strftime("%b %d")  # e.g. "Dec 18"
+            today_formatted = datetime.now(SF_TZ).strftime("%B %d, %Y")
+            
             prompt = f"""
             CONTEXT:
             You are an AI validator for a habit-tracking app. 
             Users must upload screenshot(s) of their daily food log to prove they are tracking their food intake.
             
-            CURRENT DATE (LOGICAL DATE): {date}
-            IMPORTANT TIME RULE:
-            - The user's "day" runs from 5:00am to 5:00am in their local time (America/Los_Angeles).
-            - If the screenshot is taken before 5:00am, MyFitnessPal may label the log as "Yesterday".
-              In that case, "Yesterday" is VALID for CURRENT DATE as long as the on-screen time is before 5:00am.
+            REQUIRED DATE TO VERIFY: {date} ({required_date_formatted})
+            TODAY'S ACTUAL DATE: {today_formatted} ({TIMEZONE_NAME})
             INPUT: {len(image_parts)} image(s).
             
-            YOUR TASK:
-            Analyze the provided image(s) to verify it is a legitimate, unique food log for CURRENT DATE (using the time rule above).
+            The food log app must show entries for **{required_date_formatted}** (also written as "{required_date_short}" or "{date}").
+            
+            SPECIAL CASE - "Yesterday" label:
+            - If the device clock/status bar visible in the screenshot shows a time BEFORE {DAY_START_HOUR}:00am, AND
+            - The food log app displays "Yesterday" instead of an explicit date, AND  
+            - "Yesterday" relative to that device time equals {required_date_formatted},
+            - THEN treat "Yesterday" as valid for the required date.
+            - Otherwise, the app MUST show the explicit date {required_date_formatted}.
             
             VERIFICATION STEPS:
             1. **Relevance**: Is this a food log? If random photo, return 'FALSE'.
-            2. **Calorie Check**: Sum total calories. 
+            2. **Date Check**: The recording must display {required_date_formatted} (or valid "Yesterday" per above).
+               - If the date shown does NOT match {required_date_formatted}, return 'FALSE'.
+            3. **Calorie Check**: Sum total calories visible. 
                - If < 1200, return 'FALSE'.
                - If visibly incomplete (e.g. only breakfast) and low calories, return 'FALSE'.
-            3. **Date Check**:
-               - Prefer explicit dates shown in the app UI.
-               - If the app shows a relative label like "Yesterday", treat it as VALID for CURRENT DATE only when the device/status-bar time visible in the screenshot is before 5:00am.
             
             OUTPUT:
-            Return ONLY the word 'TRUE' if it passes.
-            Return ONLY the word 'FALSE' if it fails.
+            Return ONLY the word 'TRUE' if all checks pass.
+            Return ONLY the word 'FALSE' if any check fails.
             """
             
             contents = [types.Part.from_text(text=prompt)] + image_parts
@@ -206,6 +258,8 @@ async def validate_log(
             for h in image_hashes:
                 record_image_hash(h, date)
             logger.info(f"Stored {len(image_hashes)} hashes for {date}")
+            # Advance pointer after successful submission (may still be locked if backlog remains)
+            advance_next_due_date(target_due_date)
 
         return UploadResponse(
             success=is_accurate,
@@ -216,44 +270,39 @@ async def validate_log(
         logger.error(f"Error processing request: {e}", exc_info=True)
         return UploadResponse(success=False, reason=str(e))
 
+class AppConfig(BaseModel):
+    day_start_hour: int
+    timezone: str
+
 class StatusResponse(BaseModel):
     submitted_today: bool
     submitted_yesterday: bool
-
-# Day boundary hour (5am) - days run from 5am to 5am
-DAY_START_HOUR = 5
-
-def get_logical_date(dt: datetime = None) -> str:
-    """
-    Get the 'logical date' for food logging purposes.
-    Days start at 5am, so 4am on Dec 19 is still 'Dec 18'.
-    """
-    if dt is None:
-        dt = datetime.now(SF_TZ)
-    
-    # If before 5am, it's still "yesterday" for logging purposes
-    if dt.hour < DAY_START_HOUR:
-        dt = dt - timedelta(days=1)
-    
-    return dt.strftime("%Y-%m-%d")
-
-def get_logical_yesterday(dt: datetime = None) -> str:
-    """Get yesterday's logical date."""
-    if dt is None:
-        dt = datetime.now(SF_TZ)
-    return get_logical_date(dt - timedelta(days=1))
+    target_due_date: str
+    next_due_date: str
+    is_caught_up: bool
+    config: AppConfig
 
 @app.get("/check-status", response_model=StatusResponse)
 def check_status():
     """Check if submissions exist for today and yesterday (using 5am day boundary)."""
     today = get_logical_date()
     yesterday = get_logical_yesterday()
+    target_due_date = get_due_logical_date()
+    next_due_date = advance_next_due_date(target_due_date)
+    is_caught_up = next_due_date > target_due_date
     
     logger.info(f"Checking status - logical today: {today}, logical yesterday: {yesterday}")
     
     return StatusResponse(
         submitted_today=has_submission_for_date(today),
-        submitted_yesterday=has_submission_for_date(yesterday)
+        submitted_yesterday=has_submission_for_date(yesterday),
+        target_due_date=target_due_date,
+        next_due_date=next_due_date,
+        is_caught_up=is_caught_up,
+        config=AppConfig(
+            day_start_hour=DAY_START_HOUR,
+            timezone=TIMEZONE_NAME
+        )
     )
 
 @app.get("/")
