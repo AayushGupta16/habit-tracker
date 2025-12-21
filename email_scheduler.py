@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 CONTACT_EMAILS = ["jyotigupta_mail@yahoo.com"]
 CHECK_HOUR = 22  # 10 PM - When to run the daily check
 CHECK_MINUTE = 0
-DB_NAME = "foodlog.db"
+DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "foodlog.db")
 STATE_KEY_NEXT_DUE_DATE = "next_due_date"
 
 # Day boundary hour - can be changed here and will propagate to iOS via /check-status
