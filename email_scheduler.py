@@ -58,27 +58,25 @@ def get_due_logical_date(dt: datetime = None) -> str:
 
 # Database helpers
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS uploads
-                 (date text, timestamp text)''')
-    # Enforce at most one successful upload per date. Keeps behavior idempotent.
-    c.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_date ON uploads(date)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS image_hashes
-                 (hash text PRIMARY KEY, date text, timestamp text)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS state
-                 (key text PRIMARY KEY, value text)''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS uploads
+                     (date text, timestamp text)''')
+        # Enforce at most one successful upload per date. Keeps behavior idempotent.
+        c.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_date ON uploads(date)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS image_hashes
+                     (hash text PRIMARY KEY, date text, timestamp text)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS state
+                     (key text PRIMARY KEY, value text)''')
+        conn.commit()
 
 def record_upload(date_str: str):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    # Ignore duplicates (unique date index) to keep retries safe.
-    c.execute("INSERT OR IGNORE INTO uploads VALUES (?, ?)",
-              (date_str, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        # Ignore duplicates (unique date index) to keep retries safe.
+        c.execute("INSERT OR IGNORE INTO uploads VALUES (?, ?)",
+                  (date_str, datetime.now().isoformat()))
+        conn.commit()
 
 def check_image_hash(image_hash: str, current_date: str) -> tuple[bool, str | None]:
     """
@@ -88,11 +86,10 @@ def check_image_hash(image_hash: str, current_date: str) -> tuple[bool, str | No
     - If image was used on same date: (False, None) - allow resubmission same day
     - If image was used on different date: (True, previous_date)
     """
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT date FROM image_hashes WHERE hash = ?", (image_hash,))
-    result = c.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT date FROM image_hashes WHERE hash = ?", (image_hash,))
+        result = c.fetchone()
     
     if result is None:
         return (False, None)  # New image
@@ -105,13 +102,12 @@ def check_image_hash(image_hash: str, current_date: str) -> tuple[bool, str | No
 
 def record_image_hash(image_hash: str, date_str: str):
     """Store an image hash with its date."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    # Use INSERT OR REPLACE to handle resubmissions on the same day
-    c.execute("INSERT OR REPLACE INTO image_hashes VALUES (?, ?, ?)", 
-              (image_hash, date_str, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        # Use INSERT OR REPLACE to handle resubmissions on the same day
+        c.execute("INSERT OR REPLACE INTO image_hashes VALUES (?, ?, ?)", 
+                  (image_hash, date_str, datetime.now().isoformat()))
+        conn.commit()
 
 def has_valid_upload_recently():
     # Deprecated/Unused with new logic
@@ -119,29 +115,26 @@ def has_valid_upload_recently():
 
 def has_submission_for_date(date_str: str) -> bool:
     """Check if there's a valid submission for a specific date."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT count(*) FROM uploads WHERE date = ?", (date_str,))
-    count = c.fetchone()[0]
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT count(*) FROM uploads WHERE date = ?", (date_str,))
+        count = c.fetchone()[0]
     return count > 0
 
 def _get_state_value(key: str) -> str | None:
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT value FROM state WHERE key = ?", (key,))
-    row = c.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT value FROM state WHERE key = ?", (key,))
+        row = c.fetchone()
     if row is None:
         return None
     return row[0]
 
 def _set_state_value(key: str, value: str) -> None:
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO state VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO state VALUES (?, ?)", (key, value))
+        conn.commit()
 
 def _parse_yyyy_mm_dd(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
