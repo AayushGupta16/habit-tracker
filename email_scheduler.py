@@ -3,6 +3,7 @@ import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timedelta, date
 import os
+from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from zoneinfo import ZoneInfo
@@ -11,7 +12,11 @@ from zoneinfo import ZoneInfo
 CONTACT_EMAILS = ["jyotigupta_mail@yahoo.com"]
 CHECK_HOUR = 22  # 10 PM - When to run the daily check
 CHECK_MINUTE = 0
-DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "foodlog.db")
+
+# Use pathlib for more robust path resolution that survives working directory changes
+# .resolve() returns a fully resolved absolute path regardless of cwd
+_THIS_DIR = Path(__file__).resolve().parent
+DB_NAME = str(_THIS_DIR / "foodlog.db")
 STATE_KEY_NEXT_DUE_DATE = "next_due_date"
 
 # Day boundary hour - can be changed here and will propagate to iOS via /check-status
@@ -57,8 +62,25 @@ def get_due_logical_date(dt: datetime = None) -> str:
     return get_logical_yesterday(dt)
 
 # Database helpers
+def _get_db_connection():
+    """Get a database connection with better error handling."""
+    try:
+        # Verify the parent directory exists
+        db_path = Path(DB_NAME)
+        if not db_path.parent.exists():
+            raise RuntimeError(f"Database directory does not exist: {db_path.parent}")
+        return sqlite3.connect(DB_NAME)
+    except sqlite3.OperationalError as e:
+        # Log detailed info for debugging
+        print(f"ERROR: Failed to open database at {DB_NAME}")
+        print(f"  - Path exists: {Path(DB_NAME).exists()}")
+        print(f"  - Parent dir exists: {Path(DB_NAME).parent.exists()}")
+        print(f"  - Current working directory: {os.getcwd()}")
+        print(f"  - __file__ resolved to: {Path(__file__).resolve()}")
+        raise
+
 def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
+    with _get_db_connection() as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS uploads
                      (date text, timestamp text)''')
@@ -71,7 +93,7 @@ def init_db():
         conn.commit()
 
 def record_upload(date_str: str):
-    with sqlite3.connect(DB_NAME) as conn:
+    with _get_db_connection() as conn:
         c = conn.cursor()
         # Ignore duplicates (unique date index) to keep retries safe.
         c.execute("INSERT OR IGNORE INTO uploads VALUES (?, ?)",
@@ -86,7 +108,7 @@ def check_image_hash(image_hash: str, current_date: str) -> tuple[bool, str | No
     - If image was used on same date: (False, None) - allow resubmission same day
     - If image was used on different date: (True, previous_date)
     """
-    with sqlite3.connect(DB_NAME) as conn:
+    with _get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT date FROM image_hashes WHERE hash = ?", (image_hash,))
         result = c.fetchone()
@@ -102,7 +124,7 @@ def check_image_hash(image_hash: str, current_date: str) -> tuple[bool, str | No
 
 def record_image_hash(image_hash: str, date_str: str):
     """Store an image hash with its date."""
-    with sqlite3.connect(DB_NAME) as conn:
+    with _get_db_connection() as conn:
         c = conn.cursor()
         # Use INSERT OR REPLACE to handle resubmissions on the same day
         c.execute("INSERT OR REPLACE INTO image_hashes VALUES (?, ?, ?)", 
@@ -115,14 +137,14 @@ def has_valid_upload_recently():
 
 def has_submission_for_date(date_str: str) -> bool:
     """Check if there's a valid submission for a specific date."""
-    with sqlite3.connect(DB_NAME) as conn:
+    with _get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT count(*) FROM uploads WHERE date = ?", (date_str,))
         count = c.fetchone()[0]
     return count > 0
 
 def _get_state_value(key: str) -> str | None:
-    with sqlite3.connect(DB_NAME) as conn:
+    with _get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT value FROM state WHERE key = ?", (key,))
         row = c.fetchone()
@@ -131,7 +153,7 @@ def _get_state_value(key: str) -> str | None:
     return row[0]
 
 def _set_state_value(key: str, value: str) -> None:
-    with sqlite3.connect(DB_NAME) as conn:
+    with _get_db_connection() as conn:
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO state VALUES (?, ?)", (key, value))
         conn.commit()
