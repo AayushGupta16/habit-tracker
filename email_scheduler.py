@@ -13,11 +13,14 @@ CONTACT_EMAILS = ["jyotigupta_mail@yahoo.com"]
 CHECK_HOUR = 22  # 10 PM - When to run the daily check
 CHECK_MINUTE = 0
 
-# Use pathlib for more robust path resolution that survives working directory changes
-# .resolve() returns a fully resolved absolute path regardless of cwd
+# Database path - use DB_PATH env var if set, otherwise default to script directory
+# IMPORTANT: On servers with expiring home directory permissions (Kerberos/LDAP),
+# set DB_PATH to a persistent location like /var/lib/habit-tracker/foodlog.db
 _THIS_DIR = Path(__file__).resolve().parent
-DB_NAME = str(_THIS_DIR / "foodlog.db")
+DB_NAME = os.environ.get("DB_PATH", str(_THIS_DIR / "foodlog.db"))
 STATE_KEY_NEXT_DUE_DATE = "next_due_date"
+
+print(f"[email_scheduler] Using database: {DB_NAME}")
 
 # Day boundary hour - can be changed here and will propagate to iOS via /check-status
 DAY_START_HOUR = 5
