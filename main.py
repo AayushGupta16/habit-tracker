@@ -155,35 +155,36 @@ async def validate_log(
             REQUIRED DATE TO VERIFY: {date} ({required_date_formatted})
             TODAY'S ACTUAL DATE: {today_formatted} ({TIMEZONE_NAME})
             
-            DATE VALIDATION RULES:
-            The food log must be for **{required_date_formatted}**. Accept ANY of these as valid:
+            CRITICAL - "LOGICAL DAY" RULE:
+            This app uses a day boundary of {DAY_START_HOUR}:00 AM, NOT midnight.
+            So times from 12:00am to {DAY_START_HOUR - 1}:59am on {next_day_formatted} are STILL part of {required_date_formatted}.
             
-            1. **Explicit date shown**: The food app displays {required_date_formatted} (or "{required_date_short}" or "{date}").
+            IMPORTANT - iOS TIME FORMAT:
+            Apple devices often show time WITHOUT AM/PM (e.g., "2:13" not "2:13 AM").
+            If you see a time like 1:xx, 2:xx, 3:xx, or 4:xx without AM/PM on {next_day_formatted},
+            ASSUME it is AM (early morning), which makes it VALID for {required_date_formatted}.
             
-            2. **"Yesterday" label**: The food app shows "Yesterday" AND the device clock shows a time 
-               BEFORE {DAY_START_HOUR}:00am on {next_day_formatted}.
-            
-            3. **No date in app, but phone clock confirms**: If the food tracking app does NOT display 
-               any date (some apps like MyFitnessPal don't show the date prominently), then look at the 
-               device's status bar clock/date. Accept as valid if EITHER:
-               - The phone shows {required_date_formatted} (any time), OR
-               - The phone shows {next_day_formatted} ({next_day_short}) AND the time is BEFORE {DAY_START_HOUR}:00am
-                 (because the "logical day" extends until {DAY_START_HOUR}am the next calendar day)
+            DATE VALIDATION - Accept as VALID if ANY of these are true:
+            1. Food app explicitly shows {required_date_formatted} (or "{required_date_short}")
+            2. Food app shows "Today" and phone date is {required_date_formatted}
+            3. Food app shows "Yesterday" and phone shows {next_day_formatted}
+            4. Phone clock shows {required_date_formatted} (any time)
+            5. Phone clock shows {next_day_formatted} with time 12:xx, 1:xx, 2:xx, 3:xx, or 4:xx 
+               (assumed AM = before {DAY_START_HOUR}am cutoff = VALID)
             
             YOUR TASK:
-            Analyze the video to verify:
-            1. The user is in a food tracking app (showing food/calories).
-            2. The date is valid per the rules above.
-            3. The total calories for the day are > 1200.
+            1. Confirm this is a food tracking app (showing food/calories).
+            2. Check date validity using the rules above.
+            3. Verify total calories > 1200.
             
             OUTPUT FORMAT:
-            - If all checks pass: Return ONLY the word 'TRUE'
+            - If all checks pass: Return ONLY 'TRUE'
             - If any check fails: Return 'FALSE: <reason>' where reason is one of:
-              - 'not a food log' (if not a food tracking app)
-              - 'wrong date - saw <date shown>' (if date doesn't match per rules above)
-              - 'calories too low - saw <X> calories' (if under 1200)
-              - 'date not visible' (if you cannot determine the date from app or phone clock)
-              - 'calories not visible' (if total calories not shown)
+              - 'not a food log'
+              - 'wrong date - saw <date> at <time>'
+              - 'calories too low - saw <X> calories'
+              - 'date not visible'
+              - 'calories not visible'
             """
             
             contents = [
@@ -238,34 +239,36 @@ async def validate_log(
             TODAY'S ACTUAL DATE: {today_formatted} ({TIMEZONE_NAME})
             INPUT: {len(image_parts)} image(s).
             
-            DATE VALIDATION RULES:
-            The food log must be for **{required_date_formatted}**. Accept ANY of these as valid:
+            CRITICAL - "LOGICAL DAY" RULE:
+            This app uses a day boundary of {DAY_START_HOUR}:00 AM, NOT midnight.
+            So times from 12:00am to {DAY_START_HOUR - 1}:59am on {next_day_formatted} are STILL part of {required_date_formatted}.
             
-            1. **Explicit date shown**: The food app displays {required_date_formatted} (or "{required_date_short}" or "{date}").
+            IMPORTANT - iOS TIME FORMAT:
+            Apple devices often show time WITHOUT AM/PM (e.g., "2:13" not "2:13 AM").
+            If you see a time like 1:xx, 2:xx, 3:xx, or 4:xx without AM/PM on {next_day_formatted},
+            ASSUME it is AM (early morning), which makes it VALID for {required_date_formatted}.
             
-            2. **"Yesterday" label**: The food app shows "Yesterday" AND the device clock shows a time 
-               BEFORE {DAY_START_HOUR}:00am on {next_day_formatted}.
-            
-            3. **No date in app, but phone clock confirms**: If the food tracking app does NOT display 
-               any date (some apps like MyFitnessPal don't show the date prominently), then look at the 
-               device's status bar clock/date. Accept as valid if EITHER:
-               - The phone shows {required_date_formatted} (any time), OR
-               - The phone shows {next_day_formatted} ({next_day_short}) AND the time is BEFORE {DAY_START_HOUR}:00am
-                 (because the "logical day" extends until {DAY_START_HOUR}am the next calendar day)
+            DATE VALIDATION - Accept as VALID if ANY of these are true:
+            1. Food app explicitly shows {required_date_formatted} (or "{required_date_short}")
+            2. Food app shows "Today" and phone date is {required_date_formatted}
+            3. Food app shows "Yesterday" and phone shows {next_day_formatted}
+            4. Phone clock shows {required_date_formatted} (any time)
+            5. Phone clock shows {next_day_formatted} with time 12:xx, 1:xx, 2:xx, 3:xx, or 4:xx 
+               (assumed AM = before {DAY_START_HOUR}am cutoff = VALID)
             
             VERIFICATION STEPS:
-            1. **Relevance**: Is this a food log? If random photo, reject.
-            2. **Date Check**: Verify the date per the rules above.
-            3. **Calorie Check**: Sum total calories visible. Must be > 1200.
+            1. Confirm this is a food tracking app (showing food/calories).
+            2. Check date validity using the rules above.
+            3. Verify total calories > 1200.
             
             OUTPUT FORMAT:
-            - If all checks pass: Return ONLY the word 'TRUE'
+            - If all checks pass: Return ONLY 'TRUE'
             - If any check fails: Return 'FALSE: <reason>' where reason is one of:
-              - 'not a food log' (if not a food tracking app)
-              - 'wrong date - saw <date shown>' (if date doesn't match per rules above)
-              - 'calories too low - saw <X> calories' (if under 1200)
-              - 'date not visible' (if you cannot determine the date from app or phone clock)
-              - 'calories not visible' (if total calories not shown)
+              - 'not a food log'
+              - 'wrong date - saw <date> at <time>'
+              - 'calories too low - saw <X> calories'
+              - 'date not visible'
+              - 'calories not visible'
             """
             
             contents = [types.Part.from_text(text=prompt)] + image_parts
