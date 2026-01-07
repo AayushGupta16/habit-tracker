@@ -167,9 +167,14 @@ async def validate_log(
             2. They scroll/navigate to show the DATE, and it matches the REQUIRED DATE: {required_date_formatted}.
             3. The total calories for the day are > 1200.
             
-            OUTPUT:
-            Return ONLY the word 'TRUE' if all checks pass.
-            Return ONLY the word 'FALSE' if any check fails.
+            OUTPUT FORMAT:
+            - If all checks pass: Return ONLY the word 'TRUE'
+            - If any check fails: Return 'FALSE: <reason>' where reason is one of:
+              - 'not a food log' (if not a food tracking app)
+              - 'wrong date - saw <date shown>' (if date doesn't match)
+              - 'calories too low - saw <X> calories' (if under 1200)
+              - 'date not visible' (if you cannot find the date in the recording)
+              - 'calories not visible' (if total calories not shown)
             """
             
             contents = [
@@ -231,16 +236,18 @@ async def validate_log(
             - Otherwise, the app MUST show the explicit date {required_date_formatted}.
             
             VERIFICATION STEPS:
-            1. **Relevance**: Is this a food log? If random photo, return 'FALSE'.
-            2. **Date Check**: The recording must display {required_date_formatted} (or valid "Yesterday" per above).
-               - If the date shown does NOT match {required_date_formatted}, return 'FALSE'.
-            3. **Calorie Check**: Sum total calories visible. 
-               - If < 1200, return 'FALSE'.
-               - If visibly incomplete (e.g. only breakfast) and low calories, return 'FALSE'.
+            1. **Relevance**: Is this a food log? If random photo, reject.
+            2. **Date Check**: The screenshot must display {required_date_formatted} (or valid "Yesterday" per above).
+            3. **Calorie Check**: Sum total calories visible. Must be > 1200.
             
-            OUTPUT:
-            Return ONLY the word 'TRUE' if all checks pass.
-            Return ONLY the word 'FALSE' if any check fails.
+            OUTPUT FORMAT:
+            - If all checks pass: Return ONLY the word 'TRUE'
+            - If any check fails: Return 'FALSE: <reason>' where reason is one of:
+              - 'not a food log' (if not a food tracking app)
+              - 'wrong date - saw <date shown>' (if date doesn't match)
+              - 'calories too low - saw <X> calories' (if under 1200)
+              - 'date not visible' (if you cannot find the date in the screenshot)
+              - 'calories not visible' (if total calories not shown)
             """
             
             contents = [types.Part.from_text(text=prompt)] + image_parts
@@ -265,10 +272,26 @@ async def validate_log(
         raw_text = response.text or ""
         logger.info(f"Gemini raw response: {raw_text}")
         
-        text_response = raw_text.strip().lower()
-        is_accurate = text_response == "true"
+        text_response = raw_text.strip()
+        text_lower = text_response.lower()
         
-        logger.info(f"Validation result: {is_accurate} (Reason: {text_response})")
+        # Parse response - can be "TRUE", "FALSE", or "FALSE: <reason>"
+        if text_lower == "true":
+            is_accurate = True
+            failure_reason = None
+        elif text_lower.startswith("false"):
+            is_accurate = False
+            # Extract reason if provided (e.g., "FALSE: wrong date - saw Jan 5")
+            if ":" in text_response:
+                failure_reason = text_response.split(":", 1)[1].strip()
+            else:
+                failure_reason = "unspecified"
+        else:
+            # Unexpected response format
+            is_accurate = False
+            failure_reason = f"unexpected response: {text_response[:100]}"
+        
+        logger.info(f"Validation result: {is_accurate} (Failure reason: {failure_reason})")
 
         if is_accurate:
             # Record the successful upload
@@ -279,10 +302,11 @@ async def validate_log(
             logger.info(f"Stored {len(image_hashes)} hashes for {date}")
             # Advance pointer after successful submission (may still be locked if backlog remains)
             advance_next_due_date(target_due_date)
+            return UploadResponse(success=True, reason="Validated successfully")
 
         return UploadResponse(
-            success=is_accurate,
-            reason=f"Gemini evaluation ({gemini_reason}): {text_response}"
+            success=False,
+            reason=f"Validation failed: {failure_reason}"
         )
 
     except Exception as e:
