@@ -3,8 +3,12 @@ import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timedelta, date
 import os
+import time
+import json
 from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
+import httpx
+import jwt
 
 from zoneinfo import ZoneInfo
 
@@ -12,6 +16,17 @@ from zoneinfo import ZoneInfo
 CONTACT_EMAILS = ["jyotigupta_mail@yahoo.com"]
 CHECK_HOUR = 22  # 10 PM - When to run the daily check
 CHECK_MINUTE = 0
+PUSH_CHECK_HOUR = 5  # 5 AM - When to send push notification to lock phone
+PUSH_CHECK_MINUTE = 0
+
+# APNs Configuration (set via environment variables)
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "")
+APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "")
+APNS_BUNDLE_ID = os.environ.get("APNS_BUNDLE_ID", "com.aayush.god")
+# Path to .p8 key file, or the key content directly
+APNS_KEY_PATH = os.environ.get("APNS_KEY_PATH", "")
+APNS_KEY_CONTENT = os.environ.get("APNS_KEY_CONTENT", "")  # Alternative: key as env var
+APNS_USE_SANDBOX = os.environ.get("APNS_USE_SANDBOX", "false").lower() == "true"
 
 # Database path - use DB_PATH env var if set, otherwise default to script directory
 # IMPORTANT: On servers with expiring home directory permissions (Kerberos/LDAP),
@@ -93,7 +108,147 @@ def init_db():
                      (hash text PRIMARY KEY, date text, timestamp text)''')
         c.execute('''CREATE TABLE IF NOT EXISTS state
                      (key text PRIMARY KEY, value text)''')
+        # Device tokens for push notifications
+        c.execute('''CREATE TABLE IF NOT EXISTS device_tokens
+                     (token text PRIMARY KEY, created_at text, last_used text)''')
         conn.commit()
+
+# ============================================================================
+# PUSH NOTIFICATION FUNCTIONS
+# ============================================================================
+
+def register_device_token(token: str) -> bool:
+    """Register or update a device token for push notifications."""
+    if not token:
+        return False
+    with _get_db_connection() as conn:
+        c = conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute("""
+            INSERT INTO device_tokens (token, created_at, last_used)
+            VALUES (?, ?, ?)
+            ON CONFLICT(token) DO UPDATE SET last_used = ?
+        """, (token, now, now, now))
+        conn.commit()
+    print(f"[push] Registered device token: {token[:20]}...")
+    return True
+
+def get_all_device_tokens() -> list[str]:
+    """Get all registered device tokens."""
+    with _get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT token FROM device_tokens")
+        rows = c.fetchall()
+    return [row[0] for row in rows]
+
+def remove_device_token(token: str):
+    """Remove an invalid device token."""
+    with _get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM device_tokens WHERE token = ?", (token,))
+        conn.commit()
+    print(f"[push] Removed invalid token: {token[:20]}...")
+
+def _get_apns_auth_token() -> str | None:
+    """Generate a JWT for APNs authentication."""
+    if not APNS_KEY_ID or not APNS_TEAM_ID:
+        print("[push] APNs not configured (missing KEY_ID or TEAM_ID)")
+        return None
+    
+    # Load the private key
+    private_key = None
+    if APNS_KEY_CONTENT:
+        private_key = APNS_KEY_CONTENT
+    elif APNS_KEY_PATH and os.path.exists(APNS_KEY_PATH):
+        with open(APNS_KEY_PATH, 'r') as f:
+            private_key = f.read()
+    
+    if not private_key:
+        print("[push] APNs not configured (missing private key)")
+        return None
+    
+    # Create JWT token
+    token = jwt.encode(
+        {
+            "iss": APNS_TEAM_ID,
+            "iat": int(time.time())
+        },
+        private_key,
+        algorithm="ES256",
+        headers={
+            "alg": "ES256",
+            "kid": APNS_KEY_ID
+        }
+    )
+    return token
+
+def send_push_notification(device_token: str, title: str, body: str, data: dict = None) -> bool:
+    """Send a push notification to a single device."""
+    auth_token = _get_apns_auth_token()
+    if not auth_token:
+        return False
+    
+    # APNs endpoint
+    if APNS_USE_SANDBOX:
+        url = f"https://api.sandbox.push.apple.com/3/device/{device_token}"
+    else:
+        url = f"https://api.push.apple.com/3/device/{device_token}"
+    
+    # Build payload
+    payload = {
+        "aps": {
+            "alert": {
+                "title": title,
+                "body": body
+            },
+            "sound": "default",
+            "content-available": 1  # Enable background processing
+        }
+    }
+    if data:
+        payload["data"] = data
+    
+    headers = {
+        "authorization": f"bearer {auth_token}",
+        "apns-topic": APNS_BUNDLE_ID,
+        "apns-push-type": "alert",
+        "apns-priority": "10"
+    }
+    
+    try:
+        # Use HTTP/2 client
+        with httpx.Client(http2=True) as client:
+            response = client.post(url, json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                print(f"[push] Sent notification to {device_token[:20]}...")
+                return True
+            elif response.status_code == 410:
+                # Token is no longer valid
+                print(f"[push] Token expired/invalid: {device_token[:20]}...")
+                remove_device_token(device_token)
+                return False
+            else:
+                print(f"[push] Failed to send: {response.status_code} - {response.text}")
+                return False
+    except Exception as e:
+        print(f"[push] Error sending notification: {e}")
+        return False
+
+def send_push_to_all(title: str, body: str, data: dict = None) -> int:
+    """Send a push notification to all registered devices. Returns count of successful sends."""
+    tokens = get_all_device_tokens()
+    if not tokens:
+        print("[push] No device tokens registered")
+        return 0
+    
+    success_count = 0
+    for token in tokens:
+        if send_push_notification(token, title, body, data):
+            success_count += 1
+    
+    print(f"[push] Sent to {success_count}/{len(tokens)} devices")
+    return success_count
 
 def record_upload(date_str: str):
     with _get_db_connection() as conn:
@@ -246,8 +401,45 @@ def scheduled_check():
     else:
         print(f"User is caught up (Next: {next_due_date} > Target: {target_due_date}).")
 
+def scheduled_push_check():
+    """
+    5 AM push check - sends a push notification to wake up the iOS app.
+    The app will then sync with the server and lock/unlock accordingly.
+    """
+    print("Running 5 AM push check...")
+    
+    target_due_date = get_due_logical_date()
+    next_due_date = advance_next_due_date(target_due_date)
+    
+    # Determine if phone should be locked
+    should_lock = next_due_date <= target_due_date
+    
+    print(f"5AM Push Check: Target={target_due_date}, Next={next_due_date}, ShouldLock={should_lock}")
+    
+    # Send push notification to wake the app
+    # The notification includes lock status so app can update immediately
+    if should_lock:
+        title = "⚠️ Phone Locked"
+        body = f"Log your food for {next_due_date} to unlock"
+    else:
+        title = "✅ Good morning!"
+        body = "You're all caught up on food logs"
+    
+    data = {
+        "action": "sync",
+        "should_lock": should_lock,
+        "next_due_date": next_due_date,
+        "target_due_date": target_due_date
+    }
+    
+    count = send_push_to_all(title, body, data)
+    print(f"5AM Push: Sent to {count} device(s)")
+
 def create_scheduler():
     scheduler = BackgroundScheduler()
+    # 10 PM - Email check for users who are >24h behind
     scheduler.add_job(scheduled_check, 'cron', hour=CHECK_HOUR, minute=CHECK_MINUTE)
+    # 5 AM - Push notification to wake iOS app and apply lock state
+    scheduler.add_job(scheduled_push_check, 'cron', hour=PUSH_CHECK_HOUR, minute=PUSH_CHECK_MINUTE)
     return scheduler
 

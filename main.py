@@ -31,6 +31,7 @@ from email_scheduler import (
     get_logical_date,
     get_logical_yesterday,
     get_due_logical_date,
+    register_device_token,
     SF_TZ,
     DAY_START_HOUR,
     TIMEZONE_NAME
@@ -389,6 +390,26 @@ def check_status():
             timezone=TIMEZONE_NAME
         )
     )
+
+class DeviceTokenRequest(BaseModel):
+    token: str
+
+class DeviceTokenResponse(BaseModel):
+    success: bool
+    message: str
+
+@app.post("/register-device", response_model=DeviceTokenResponse)
+async def register_device(request: DeviceTokenRequest):
+    """Register a device token for push notifications."""
+    if not request.token:
+        return DeviceTokenResponse(success=False, message="Token is required")
+    
+    success = register_device_token(request.token)
+    if success:
+        logger.info(f"Registered device token: {request.token[:20]}...")
+        return DeviceTokenResponse(success=True, message="Device registered successfully")
+    else:
+        return DeviceTokenResponse(success=False, message="Failed to register device")
 
 @app.get("/")
 def health_check():
